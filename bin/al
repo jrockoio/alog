@@ -23,7 +23,7 @@ import time
 
 
 MAX_LINE = 65536
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 DEFAULT_LIMIT = 10 * 1024 * 1024
 NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
 RUN_ID = re.compile(r"[0-9a-f]{10}\Z")
@@ -38,6 +38,14 @@ SECRET_FIELD = re.compile(
        api[_-]?key|private[_-]?key|access[_-]?key|connection[_-]?string)
     [\w.-]* ["']? \s* (?:[:=]|\s+\S)
     """
+)
+# Match only complete, familiar prompts, never a generic "password:" field or
+# a prompt prefix followed by a value. SSH relays remote terminal prompts into
+# captured output even though local /dev/tty prompts normally bypass capture.
+PASSWORD_PROMPT = re.compile(
+    r"(?:\[sudo\] password for [A-Za-z0-9_.-]+|"
+    r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.:\[\]%-]+'s password|"
+    r"(?:New|Retype new) SMB password):[ \t]*\n?"
 )
 TOKEN = re.compile(
     r"(?i)(?:\b(?:gh[pousr]_|github_pat_)[a-z0-9_]{16,}|"
@@ -181,6 +189,8 @@ class Redactor:
         if PRIVATE_BEGIN.search(text):
             self.private_key = not bool(PRIVATE_END.search(text))
             return "[REDACTED private key]\n"
+        if PASSWORD_PROMPT.fullmatch(text):
+            return "[REDACTED password prompt]\n"
         if SECRET_FIELD.search(text):
             # Multiline JSON/YAML/PEM-like values cannot safely be handled by
             # a one-line substitution. Conservatively omit the remaining output.

@@ -217,6 +217,88 @@ class AlogTests(unittest.TestCase):
         self.assertNotIn("after", result.stdout)
         self.assertIn("remaining output omitted", result.stdout)
 
+    def test_remote_password_prompts_keep_later_diagnostics(self):
+        prompts = (
+            "[sudo] password for example-user: ",
+            "example-user@server.example.invalid's password: ",
+            "example-user@2001:db8::1's password: ",
+            "New SMB password:",
+            "Retype new SMB password:",
+        )
+        for index, prompt in enumerate(prompts):
+            with self.subTest(prompt=prompt):
+                context = f"prompt-{index}"
+                # Remote SSH output includes prompts and CRLF; split a prompt
+                # across writes so it cannot rely on a single output chunk.
+                source = (
+                    "import os, time\n"
+                    f"prompt = {prompt!r}.encode()\n"
+                    "os.write(2, b'\\x1b[33m' + prompt[:8])\n"
+                    "time.sleep(.02)\n"
+                    "os.write(2, prompt[8:] + b'\\x1b[0m\\r\\n')\n"
+                    "print('service check passed')\n"
+                    "raise SystemExit(7)\n"
+                )
+                result = self.command(source, "-c", context)
+                self.assertEqual(result.returncode, 7, result.stderr)
+                expected = "[REDACTED password prompt]\nservice check passed\n"
+                self.assertEqual(result.stdout, expected)
+                self.assertEqual(self.run_al("-c", context, "--read").stdout, expected)
+                meta = next(m for m in self.metadata() if m["context"] == context)
+                self.assertFalse(meta["sensitive_tail_omitted"])
+
+    def test_password_prompt_at_eof_is_redacted(self):
+        result = self.command("import os; os.write(2, b'[sudo] password for example: ')")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "[REDACTED password prompt]\n")
+        self.assertFalse(self.metadata()[0]["sensitive_tail_omitted"])
+
+    def test_prompt_like_secret_fields_still_suppress_tail(self):
+        fields = (
+            "password:",
+            "password: |",
+            "password = {",
+            'password: """',
+            '  "[sudo] password for example":',
+            "[sudo] password for example: password:",
+            "New SMB password: >",
+            "metadata: example@server.example.invalid's password:",
+            "credentials:\n[ sudo ] password for example:",
+        )
+        for index, field in enumerate(fields):
+            with self.subTest(field=field):
+                context = f"field-{index}"
+                source = f"print({field!r}); print('synthetic-hidden-value'); print('later')"
+                result = self.command(source, "-c", context)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("remaining output omitted", result.stdout)
+                self.assertNotIn("synthetic-hidden-value", result.stdout)
+                self.assertNotIn("later", result.stdout)
+                self.assertEqual(self.run_al("-c", context, "--read").stdout, result.stdout)
+                meta = next(m for m in self.metadata() if m["context"] == context)
+                self.assertTrue(meta["sensitive_tail_omitted"])
+
+    def test_prompts_do_not_end_secret_suppression(self):
+        for index, opener in enumerate(("password:", "-----BEGIN OPENSSH PRIVATE KEY-----")):
+            with self.subTest(opener=opener):
+                source = (
+                    f"print({opener!r})\n"
+                    "print('[sudo] password for example: ')\n"
+                    "print('synthetic-hidden-value')\n"
+                )
+                result = self.command(source, "-c", f"suppressed-{index}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("password prompt", result.stdout)
+                self.assertNotIn("synthetic-hidden-value", result.stdout)
+
+    def test_echoed_value_after_prompt_is_not_a_prompt_exception(self):
+        result = self.command(
+            "print('[sudo] password for example: synthetic-echoed-value'); print('later')"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "[REDACTED sensitive line]\nlater\n")
+        self.assertNotIn("synthetic-echoed-value", self.run_al("--read").stdout)
+
     def test_input_not_recorded(self):
         result = self.command("input(); print('received')", input="synthetic-typed-secret\n")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -241,6 +323,21 @@ class AlogTests(unittest.TestCase):
         self.assertTrue(self.metadata()[0]["truncated"])
 
     def test_terminal_prompt_live_and_input_not_recorded(self):
+        self.assert_terminal_prompt_capture(
+            "Synthetic password: ", "getpass.getpass('Synthetic password: ')",
+            "colored\naccepted\n",
+        )
+
+    def test_remote_style_terminal_prompt_keeps_output_and_hides_input(self):
+        # Like SSH relaying a remote prompt, this writes the prompt to captured
+        # stderr while reading the hidden password from the original terminal.
+        self.assert_terminal_prompt_capture(
+            "[sudo] password for example: ",
+            "getpass.getpass('[sudo] password for example: ', stream=sys.stderr)",
+            "colored\n[REDACTED password prompt]\naccepted\n",
+        )
+
+    def assert_terminal_prompt_capture(self, prompt, getpass_call, expected_log):
         # A real controlling terminal exercises getpass, like sudo, without sudo.
         pid, master = pty.fork()
         if pid == 0:
@@ -249,7 +346,7 @@ class AlogTests(unittest.TestCase):
                 PYTHON, str(AL), "/usr/bin/python3", "-c",
                 "import getpass, sys; "
                 "print('\\x1b[32mcolored\\x1b[0m' if sys.stdout.isatty() else 'no-color', flush=True); "
-                "getpass.getpass('Synthetic password: '); print('accepted')",
+                f"{getpass_call}; print('accepted')",
             ], self.env)
         output = b""
         deadline = time.monotonic() + 8
@@ -266,7 +363,7 @@ class AlogTests(unittest.TestCase):
                 if not chunk:
                     break
                 output += chunk
-                if b"Synthetic password:" in output and not sent:
+                if prompt.encode() in output and not sent:
                     os.write(master, b"synthetic-terminal-password\n")
                     sent = True
             waited, status = os.waitpid(pid, os.WNOHANG)
@@ -280,7 +377,11 @@ class AlogTests(unittest.TestCase):
         self.assertTrue(sent)
         self.assertIn(b"\x1b[32mcolored\x1b[0m", output)
         self.assertNotIn(b"synthetic-terminal-password", output)
-        self.assertEqual(self.run_al("--read").stdout, "colored\naccepted\n")
+        self.assertEqual(self.run_al("--read").stdout, expected_log)
+        self.assertFalse(self.metadata()[0]["sensitive_tail_omitted"])
+        for path in self.logs.rglob("*"):
+            if path.is_file():
+                self.assertNotIn("synthetic-terminal-password", path.read_text())
 
     def test_signal_is_forwarded_and_log_finalized(self):
         proc = subprocess.Popen([

@@ -112,6 +112,12 @@ while still saving the log and printing the handoff.
   Sensitive fields that appear to introduce a multiline value suppress the
   rest of the output conservatively. A line over 64 KiB also suppresses the
   remaining output instead of risking a partially saved secret.
+- Complete standard English sudo, SSH `user@host`, and SMB password prompts
+  are replaced with `[REDACTED password prompt]` without suppressing later
+  diagnostics. This also handles remote prompts relayed through SSH. Generic
+  fields such as `password:` and prompts with extra field syntax still receive
+  conservative multiline handling. Prompt recognition is a narrow heuristic,
+  not proof that the following output is safe; commands must not echo secrets.
 - Values of inherited environment variables with secret-like names are
   redacted automatically when at least four characters long. Add a custom
   variable with `--redact-env NAME`; only its name goes in the command line.
