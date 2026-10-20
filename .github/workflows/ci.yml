@@ -1,0 +1,47 @@
+name: Test and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Test source
+        run: PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s tests -v
+      - name: Build committed release
+        run: /usr/bin/python3 scripts/build-release.py --ref HEAD --output dist
+      - name: Test packaged executable
+        run: |
+          mkdir unpacked
+          tar -xzf dist/alog-*-linux-any.tar.gz -C unpacked
+          ./unpacked/bin/alog --version
+          ALOG_TEST_EXECUTABLE="$PWD/unpacked/bin/al" PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s tests -v
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build tagged release
+        run: /usr/bin/python3 scripts/build-release.py --ref "$GITHUB_REF_NAME" --output dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/alog-*-linux-any.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "alog $GITHUB_REF_NAME" --generate-notes

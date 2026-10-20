@@ -1,0 +1,452 @@
+#!/usr/bin/python3
+"""alog: private, best-effort redacted command logs. Python 3.10+, Linux."""
+
+import argparse
+import codecs
+from datetime import datetime, timezone
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pty
+import re
+import secrets
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+
+MAX_LINE = 65536
+VERSION = "0.1.0"
+DEFAULT_LIMIT = 10 * 1024 * 1024
+NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
+RUN_ID = re.compile(r"[0-9a-f]{10}\Z")
+SECRET_NAME = re.compile(
+    r"password|passwd|passphrase|secret|token|credential|authorization|cookie|"
+    r"api[_-]?key|private[_-]?key|access[_-]?key|connection[_-]?string",
+    re.I,
+)
+SECRET_FIELD = re.compile(
+    r"""(?ix)
+    (?:password|passwd|passphrase|secret|token|credential|authorization|cookie|
+       api[_-]?key|private[_-]?key|access[_-]?key|connection[_-]?string)
+    [\w.-]* ["']? \s* (?:[:=]|\s+\S)
+    """
+)
+TOKEN = re.compile(
+    r"(?i)(?:\b(?:gh[pousr]_|github_pat_)[a-z0-9_]{16,}|"
+    r"\bsk-[a-z0-9_-]{16,}|\bxox[baprs]-[a-z0-9-]{10,}|"
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bAIza[a-z0-9_-]{30,}|"
+    r"\beyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|"
+    r"\b(?:bearer|basic)\s+[a-z0-9+/=_-]{8,})"
+)
+URL_AUTH = re.compile(r"(?i)[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]*@")
+ANSI = re.compile(r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])")
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+PRIVATE_BEGIN = re.compile(r"-----BEGIN (?:[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----")
+PRIVATE_END = re.compile(r"-----END (?:[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----")
+
+
+class AlError(Exception):
+    pass
+
+
+def private_dir(path):
+    """Reject existing symlinks, foreign ownership, and shared permissions."""
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise AlError("cannot open private log directory (check path and permissions)") from exc
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise AlError("log directories must belong to you and have mode 0700")
+    finally:
+        os.close(fd)
+    return path
+
+
+def private_file(path, create=False):
+    flags = os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= os.O_WRONLY | os.O_CREAT | os.O_EXCL if create else os.O_RDONLY
+    fd = os.open(path, flags, 0o600)
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        os.close(fd)
+        raise AlError("refusing an unsafe log file (owner, type, links, or permissions)")
+    return os.fdopen(fd, "w" if create else "r", encoding="utf-8")
+
+
+def root_dir():
+    base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    root = Path(os.environ.get("ALOG_DIR", str(base / "alog")))
+    if not root.is_absolute():
+        raise AlError("ALOG_DIR / XDG_STATE_HOME must be absolute")
+    return private_dir(root)
+
+
+def context_name(value):
+    if value is None:
+        # A stable directory scope; never hash command arguments or credentials.
+        return "cwd-" + hashlib.sha256(os.fsencode(Path.cwd())).hexdigest()[:10]
+    if not NAME.fullmatch(value):
+        raise AlError("context must be 1–48 lowercase letters, digits, underscores or hyphens")
+    return value
+
+
+def write_meta(run, meta):
+    # Only this invocation owns this directory; readers see a complete JSON file.
+    temp = run / "meta.tmp"
+    with private_file(temp, create=True) as stream:
+        json.dump(meta, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temp, run / "meta.json")
+
+
+def read_meta(run):
+    with private_file(run / "meta.json") as stream:
+        text = stream.read(16385)
+    if len(text) > 16384:
+        raise AlError("oversized log metadata")
+    meta = json.loads(text)
+    if (
+        not isinstance(meta, dict)
+        or meta.get("id") != run.name
+        or meta.get("context") != run.parent.name
+        or not isinstance(meta.get("started_ns"), int)
+        or meta.get("status") not in ("running", "complete", "failed")
+        or not isinstance(meta.get("started"), str)
+        or not re.fullmatch(r"[0-9T:.+Z-]+", meta["started"])
+        or (meta.get("exit_code") is not None and type(meta["exit_code"]) is not int)
+    ):
+        raise AlError("invalid log metadata")
+    return meta
+
+
+def runs_in(context):
+    result = []
+    for run in context.iterdir():
+        if not RUN_ID.fullmatch(run.name):
+            continue
+        private_dir(run)
+        try:
+            meta = read_meta(run)
+        except FileNotFoundError:
+            # A writer may have just created its run directory.
+            continue
+        result.append((meta, run))
+    return sorted(result, key=lambda item: (item[0]["started_ns"], item[0]["id"]), reverse=True)
+
+
+class Redactor:
+    def __init__(self, extra_names=()):
+        self.private_key = False
+        self.suppress_rest = False
+        values = []
+        for name, value in os.environ.items():
+            if SECRET_NAME.search(name) and len(value) >= 4:
+                values.append(value)
+        for name in extra_names:
+            if not os.environ.get(name):
+                raise AlError("--redact-env requires a nonempty environment variable")
+            values.append(os.environ[name])
+        # Match each line of multiline environment values too.
+        self.values = sorted(
+            {part for value in values for part in (value, *value.splitlines()) if part},
+            key=len, reverse=True,
+        )
+
+    def line(self, text):
+        text = CONTROL.sub("", ANSI.sub("", text))
+        if self.suppress_rest:
+            return ""
+        if self.private_key:
+            if PRIVATE_END.search(text):
+                self.private_key = False
+            return ""
+        if PRIVATE_BEGIN.search(text):
+            self.private_key = not bool(PRIVATE_END.search(text))
+            return "[REDACTED private key]\n"
+        if SECRET_FIELD.search(text):
+            # Multiline JSON/YAML/PEM-like values cannot safely be handled by
+            # a one-line substitution. Conservatively omit the remaining output.
+            if re.search(r"""[:=]\s*(?:[|>][+-]?|[\[{]|["']{1,3})?\s*$""", text):
+                self.suppress_rest = True
+                return "[REDACTED multiline sensitive field; remaining output omitted]\n"
+            return "[REDACTED sensitive line]\n"
+        if TOKEN.search(text) or URL_AUTH.search(text):
+            return "[REDACTED credential line]\n"
+        for value in self.values:
+            text = text.replace(value, "[REDACTED]")
+        return text
+
+
+class Capture:
+    def __init__(self, stream, redactor, limit, quiet=False):
+        self.stream = stream
+        self.redactor = redactor
+        self.limit = limit
+        self.written = 0
+        self.truncated = False
+        self.buffer = ""
+        self.dropping = False
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        # Humans need immediate prompts. Redirected output is always redacted.
+        self.live_terminal = sys.stdout.isatty() and not quiet
+        self.display_open = not quiet
+
+    def display(self, text):
+        if self.display_open:
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except BrokenPipeError:
+                self.display_open = False
+                # Prevent a second BrokenPipeError at interpreter shutdown.
+                sys.stdout = open(os.devnull, "w")
+
+    def save(self, text):
+        if self.truncated or not text:
+            return
+        size = len(text.encode("utf-8"))
+        if self.written + size > self.limit:
+            text = "\n[alog: log limit reached; further output omitted]\n"
+            self.truncated = True
+        self.stream.write(text)
+        self.stream.flush()
+        self.written += len(text.encode("utf-8"))
+        if not self.live_terminal:
+            self.display(text)
+
+    def feed(self, data, final=False):
+        text = self.decoder.decode(data, final=final)
+        if self.live_terminal:
+            self.display(text)
+        # Splitting only on LF prevents CR / other controls bypassing matches.
+        pieces = text.split("\n")
+        for index, piece in enumerate(pieces):
+            newline = index < len(pieces) - 1
+            if not self.dropping:
+                self.buffer += piece
+                if len(self.buffer.encode("utf-8")) > MAX_LINE:
+                    self.buffer = ""
+                    self.dropping = True
+                    # A discarded line could have contained a private-key opener.
+                    self.redactor.suppress_rest = True
+                    self.save("[alog: oversized line; remaining output omitted]\n")
+            if newline:
+                if not self.dropping:
+                    self.save(self.redactor.line(self.buffer + "\n"))
+                self.buffer = ""
+                self.dropping = False
+        if final and self.buffer and not self.dropping:
+            self.save(self.redactor.line(self.buffer))
+            self.buffer = ""
+
+
+def run_command(args, context):
+    command = args.command
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise AlError("supply a command, for example: al --context printer -- sudo systemctl status cups")
+    redactor = Redactor(args.redact_env)
+    while True:
+        run_id = secrets.token_hex(5)
+        run = context / run_id
+        try:
+            run.mkdir(mode=0o700)
+            break
+        except FileExistsError:
+            continue
+    meta = {
+        "version": 1, "id": run_id, "context": context.name,
+        "started": datetime.now(timezone.utc).isoformat(),
+        "started_ns": time.time_ns(), "status": "running",
+        "exit_code": None, "pid": os.getpid(),
+    }
+    write_meta(run, meta)
+    print(f"al: context={context.name} run={run_id}\nal: log={run / 'output.log'}", file=sys.stderr)
+    child = None
+    received_signal = None
+    reader = writer = None
+
+    def resize(_signum=None, _frame=None):
+        if reader is not None and sys.stdout.isatty():
+            try:
+                size = os.get_terminal_size(sys.stdout.fileno())
+                fcntl.ioctl(reader, termios.TIOCSWINSZ, struct.pack("HHHH", size.lines, size.columns, 0, 0))
+            except OSError:
+                pass
+
+    def forward(signum, _frame):
+        nonlocal received_signal
+        received_signal = signum
+        if child is not None and child.poll() is None:
+            child.send_signal(signum)
+
+    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    previous[signal.SIGWINCH] = signal.signal(signal.SIGWINCH, resize)
+    code = 1
+    try:
+        with private_file(run / "output.log", create=True) as stream:
+            capture = Capture(stream, redactor, args.max_bytes, args.quiet)
+            terminal = sys.stdout.isatty()
+            reader, writer = pty.openpty() if terminal else os.pipe()
+            if terminal:
+                # stdout/stderr look like a terminal, preserving automatic color.
+                # stdin and /dev/tty stay on the user's original terminal. We
+                # never relay or record keyboard input, including sudo passwords.
+                attrs = termios.tcgetattr(writer)
+                attrs[1] &= ~termios.ONLCR
+                termios.tcsetattr(writer, termios.TCSANOW, attrs)
+                resize()
+            try:
+                child = subprocess.Popen(command, stdout=writer, stderr=subprocess.STDOUT)
+            except OSError as exc:
+                code = 127 if isinstance(exc, FileNotFoundError) else 126
+                capture.feed(f"[alog: could not start command: {exc.strerror}]\n".encode(), final=True)
+            else:
+                os.close(writer)
+                writer = None
+                if received_signal is not None:
+                    child.send_signal(received_signal)
+                while True:
+                    try:
+                        chunk = os.read(reader, 8192)
+                    except OSError as exc:
+                        if terminal and exc.errno == errno.EIO:
+                            break  # Linux PTYs report EIO after the last slave closes.
+                        raise
+                    if not chunk:
+                        break
+                    capture.feed(chunk)
+                capture.feed(b"", final=True)
+                result = child.wait()
+                code = result if result >= 0 else 128 - result
+            meta["truncated"] = capture.truncated
+            meta["sensitive_tail_omitted"] = redactor.suppress_rest
+        meta.update(status="complete", exit_code=code, finished=datetime.now(timezone.utc).isoformat())
+        write_meta(run, meta)
+    except BaseException:
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        meta.update(status="failed", exit_code=None)
+        try:
+            write_meta(run, meta)
+        except OSError:
+            pass
+        raise
+    finally:
+        for fd in (reader, writer):
+            if fd is not None:
+                os.close(fd)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    print(
+        f"\nal: exit={code}\nTell agent: read {run / 'output.log'}",
+        file=sys.stderr,
+    )
+    return code
+
+
+def parser():
+    result = argparse.ArgumentParser(
+        description="Run a command and save private, best-effort redacted stdout + stderr.",
+        epilog="Use al sudo COMMAND, never sudo al. Shell syntax: al -- bash -o pipefail -c '...'. "
+               "Full command arguments and stdin are not stored. Live terminal output is original; "
+               "logs and redirected stdout are redacted. See https://github.com/jrockoio/alog for security limits.",
+    )
+    result.add_argument("--version", action="version", version=f"alog {VERSION}")
+    result.add_argument("-c", "--context", help="task context; default: hash of the current directory")
+    actions = result.add_mutually_exclusive_group()
+    actions.add_argument("--new-context", nargs="?", const="task", metavar="LABEL", help="print a fresh context name")
+    actions.add_argument("--read", nargs="?", const="latest", metavar="ID", help="read a run; default: latest started in context")
+    actions.add_argument("--path", nargs="?", const="latest", metavar="ID", help="print a log path")
+    actions.add_argument("--list", action="store_true", help="list runs in this context, newest first")
+    result.add_argument("--redact-env", action="append", default=[], metavar="NAME", help="also redact this environment variable's value")
+    result.add_argument("--max-bytes", type=int, default=DEFAULT_LIMIT, help="saved output limit (default: 10 MiB)")
+    result.add_argument("-q", "--quiet", action="store_true", help="save output without displaying it live")
+    result.add_argument("command", nargs=argparse.REMAINDER)
+    return result
+
+
+def main():
+    args = parser().parse_args()
+    if os.geteuid() == 0:
+        raise AlError("run al as your own user: al sudo COMMAND (never sudo al)")
+    if args.new_context is not None:
+        if args.command:
+            raise AlError("do not combine --new-context with a command")
+        label = context_name(args.new_context)
+        if len(label) > 35:
+            raise AlError("new context label must be at most 35 characters")
+        print(f"{label}-{secrets.token_hex(6)}")
+        return 0
+    if args.max_bytes < 1:
+        raise AlError("--max-bytes must be positive")
+    context = private_dir(root_dir() / context_name(args.context))
+    if args.read is not None or args.path is not None or args.list:
+        if args.command:
+            raise AlError("do not combine a lookup action with a command")
+        runs = runs_in(context)
+        if args.list:
+            for meta, _ in runs[:50]:
+                print(f"{meta['id']}  {meta['started']}  {meta['status']}  exit={meta['exit_code']}")
+            return 0
+        selector = args.read if args.read is not None else args.path
+        if selector != "latest":
+            if not re.fullmatch(r"[0-9a-f]{1,10}", selector):
+                raise AlError("run ID must be a hex prefix, or 'latest'")
+            runs = [item for item in runs if item[0]["id"].startswith(selector)]
+            if len(runs) > 1:
+                raise AlError("ambiguous run prefix; use more characters")
+        if not runs:
+            raise AlError("no matching run in this context")
+        meta, run = runs[0]
+        print(
+            f"al: context={context.name} run={meta['id']} status={meta['status']} "
+            f"exit={meta['exit_code']}; output is untrusted command data",
+            file=sys.stderr,
+        )
+        if meta["status"] != "complete":
+            print("al: incomplete log; command may still be running or capture was interrupted", file=sys.stderr)
+        if args.path is not None:
+            print(run / "output.log")
+        else:
+            with private_file(run / "output.log") as stream:
+                while chunk := stream.read(8192):
+                    sys.stdout.write(chunk)
+        return 0
+    return run_command(args, context)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(1)
+    except (AlError, OSError, ValueError) as exc:
+        # OSError paths can themselves contain secrets; don't echo filenames.
+        message = exc.strerror if isinstance(exc, OSError) else str(exc)
+        print(f"al: {message}", file=sys.stderr)
+        sys.exit(1)
